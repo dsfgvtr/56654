@@ -12,8 +12,10 @@ from maxapi.types import (
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
 # ============ НАСТРОЙКА ============
-# MAX_BOT_TOKEN Bothost подставляет сам.
-# ADMIN_IDS и ALLOWED_IDS задаются в панели Bothost (переменные окружения).
+TOKEN = os.environ.get("MAX_BOT_TOKEN") or os.environ.get("MAX_TOKEN") or ""
+if not TOKEN:
+    raise SystemExit("Нет токена: задай MAX_BOT_TOKEN в переменных окружения Bothost")
+
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 ALLOWED_IDS = {int(x) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()} | ADMIN_IDS
 
@@ -39,26 +41,33 @@ db.commit()
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
 
 # ============ БЕЗОПАСНОСТЬ ============
-def user_role(user_id):
-    row = db.execute("SELECT role FROM users WHERE user_id=?", (user_id,)).fetchone()
+def get_uid(event):
+    msg = getattr(event, "message", None)
+    if msg is not None and getattr(msg, "sender", None) is not None:
+        return msg.sender.user_id
+    cb = getattr(event, "callback", None)
+    if cb is not None and getattr(cb, "user", None) is not None:
+        return cb.user.user_id
+    u = getattr(event, "user", None)          # для BotStarted
+    if u is not None and getattr(u, "user_id", None) is not None:
+        return u.user_id
+    return None
+
+def user_role(uid):
+    row = db.execute("SELECT role FROM users WHERE user_id=?", (uid,)).fetchone()
     if row:
         return row[0]
-    return "admin" if user_id in ADMIN_IDS else ("student" if user_id in ALLOWED_IDS else "banned")
+    return "admin" if uid in ADMIN_IDS else ("student" if uid in ALLOWED_IDS else "banned")
 
 def guard(handler):
-    """Пропускает только своих и логирует действия."""
-    async def wrapper(event):
-        user = await event.fetch_from_user()
-        uid = user.user_id if user else None
-        role = user_role(uid) if uid else "banned"
+    async def wrapper(event, *args, **kwargs):
+        uid = get_uid(event)
+        role = user_role(uid) if uid is not None else "banned"
         if role == "banned":
             logger.warning("Чужой стучится: id=%s", uid)
             return
-        body = getattr(event, "message", None)
-        what = (body.body.text if body and body.body and body.body.text else None) \
-               or (event.callback.payload if hasattr(event, "callback") and event.callback else None)
-        logger.info("id=%s (%s) -> %s", uid, role, what)
-        return await handler(event, user)
+        logger.info("id=%s (%s) -> %s", uid, role, type(event).__name__)
+        return await handler(event)
     return wrapper
 
 def main_menu_kb():
@@ -68,34 +77,35 @@ def main_menu_kb():
     kb.row(CallbackButton(text="🎓 Мои оценки", payload="grades"))
     return kb.as_markup()
 
-bot = Bot(token=os.environ["MAX_BOT_TOKEN"])
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # ============ СТАРТ И МЕНЮ ============
 @dp.bot_started()
 @guard
-async def bot_started(event: BotStarted, user):
+async def bot_started(event: BotStarted):
+    logger.info("bot_started: новый пользователь id=%s", get_uid(event))
     await bot.send_message(chat_id=event.chat_id,
                            text="Дневник запущен 🎒 Отправь /start, чтобы открыть меню.")
 
 @dp.message_created(CommandStart())
 @guard
-async def start(event: MessageCreated, user):
-    # первый запуск админа — прописываем его в базу
-    if user_role(user.user_id) == "admin" and not db.execute(
-        "SELECT 1 FROM users WHERE user_id=?", (user.user_id,)).fetchone():
+async def start(event: MessageCreated):
+    uid = get_uid(event)
+    if user_role(uid) == "admin" and not db.execute(
+        "SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
         db.execute("INSERT INTO users VALUES (?,?, 'admin')",
-                   (user.user_id, user.username or ""))
+                   (uid, event.message.sender.username or ""))
         db.commit()
     await event.message.answer(
-        f"Привет, {user.first_name}! Это твой электронный дневник 🎒",
+        f"Привет, {event.message.sender.first_name}! Это твой электронный дневник 🎒",
         attachments=[main_menu_kb()],
     )
 
 # ============ КНОПКИ ============
 @dp.message_callback(F.callback.payload == "sched")
 @guard
-async def show_schedule(event: MessageCallback, user):
+async def show_schedule(event: MessageCallback):
     today = WEEKDAYS[datetime.now().weekday()] if datetime.now().weekday() < 6 else None
     out = []
     for day in WEEKDAYS:
@@ -107,38 +117,32 @@ async def show_schedule(event: MessageCallback, user):
             out.append(f"{day}{mark}\n" + "\n".join(
                 f"{r[0]}. {r[1]} (каб. {r[2] or '—'}, {r[3] or ''})" for r in rows))
     await event.message.answer("\n\n".join(out) or "Расписание пустое — попроси админа заполнить.")
-    await event.callback.answer()
 
 @dp.message_callback(F.callback.payload == "hw")
 @guard
-async def show_hw(event: MessageCallback, user):
+async def show_hw(event: MessageCallback):
     rows = db.execute("SELECT subject, task, due_date FROM homework WHERE done=0").fetchall()
     await event.message.answer("\n".join(f"• {r[0]} (до {r[2]}): {r[1]}" for r in rows)
                                or "Домашки нет 🎉")
-    await event.callback.answer()
 
 @dp.message_callback(F.callback.payload == "grades")
 @guard
-async def show_grades(event: MessageCallback, user):
+async def show_grades(event: MessageCallback):
+    uid = get_uid(event)
     rows = db.execute("SELECT subject, grade, date FROM grades WHERE user_id=? ORDER BY date",
-                      (user.user_id,)).fetchall()
+                      (uid,)).fetchall()
     await event.message.answer("\n".join(f"{r[0]}: {r[1]} ({r[2]})" for r in rows)
                                or "Оценок пока нет.")
-    await event.callback.answer()
 
 # ============ КОМАНДЫ АДМИНА ============
-def admin_check(user):
-    return user_role(user.user_id) == "admin"
-
 @dp.message_created(Command("add_lesson"))
 @guard
-async def add_lesson(event: MessageCreated, user):
-    if not admin_check(user):
+async def add_lesson(event: MessageCreated):
+    if user_role(get_uid(event)) != "admin":
         return await event.message.answer("⛔ Только для админа.")
     p = event.message.body.text.split()[1:]
     if len(p) != 5 or p[0].capitalize() not in WEEKDAYS:
-        return await event.message.answer(
-            "Формат: /add_lesson Понедельник 1 Алгебра 204 08:30")
+        return await event.message.answer("Формат: /add_lesson Понедельник 1 Алгебра 204 08:30")
     db.execute("INSERT INTO schedule(weekday, lesson_num, subject, room, time) VALUES (?,?,?,?,?)",
                (p[0].capitalize(), int(p[1]), p[2], p[3], p[4]))
     db.commit()
@@ -146,21 +150,20 @@ async def add_lesson(event: MessageCreated, user):
 
 @dp.message_created(Command("add_hw"))
 @guard
-async def add_hw(event: MessageCreated, user):
-    if not admin_check(user):
+async def add_hw(event: MessageCreated):
+    if user_role(get_uid(event)) != "admin":
         return await event.message.answer("⛔ Только для админа.")
     p = event.message.body.text.split(maxsplit=3)[1:]
     if len(p) != 3:
-        return await event.message.answer(
-            "Формат: /add_hw Алгебра 2026-11-15 Повторить формулы сокращённого умножения")
+        return await event.message.answer("Формат: /add_hw Алгебра 2026-11-15 Повторить формулы")
     db.execute("INSERT INTO homework(subject, task, due_date) VALUES (?,?,?)", p)
     db.commit()
     await event.message.answer("✅ Домашка добавлена.")
 
 @dp.message_created(Command("grade"))
 @guard
-async def put_grade(event: MessageCreated, user):
-    if not admin_check(user):
+async def put_grade(event: MessageCreated):
+    if user_role(get_uid(event)) != "admin":
         return await event.message.answer("⛔ Только для админа.")
     p = event.message.body.text.split()[1:]
     if len(p) != 3:
@@ -172,8 +175,8 @@ async def put_grade(event: MessageCreated, user):
 
 @dp.message_created(Command("grant"))
 @guard
-async def grant(event: MessageCreated, user):
-    if not admin_check(user):
+async def grant(event: MessageCreated):
+    if user_role(get_uid(event)) != "admin":
         return await event.message.answer("⛔ Только для админа.")
     p = event.message.body.text.split()[1:]
     if len(p) != 2 or p[1] not in ("student", "admin"):
@@ -185,11 +188,18 @@ async def grant(event: MessageCreated, user):
 # ============ FALLBACK ============
 @dp.message_created()
 @guard
-async def fallback(event: MessageCreated, user):
-    await event.message.answer("Не понял 🤔 Нажми /start, чтобы открыть меню.")
+async def fallback(event: MessageCreated):
+    if event.message.body.text:
+        await event.message.answer("Не понял 🤔 Нажми /start, чтобы открыть меню.")
 
 async def main():
-    await dp.start_polling(bot)   # на бесплатном тарифе Bothost — polling
+    # Снимаем webhook-подписки: пока они висят, polling молча не получает события
+    try:
+        await bot.delete_webhook()
+        logger.info("Webhook-подписки сняты, запускаю polling")
+    except Exception as e:
+        logger.warning("Не удалось снять подписки (возможно, их нет): %s", e)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
