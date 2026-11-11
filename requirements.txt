@@ -1,1 +1,3 @@
-maxapi
+aiomax-python
+mosdiary
+certifi
