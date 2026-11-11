@@ -1,6 +1,6 @@
-aiomax2 @ git+https://github.com/CandyCrimsie/aiomax2.git
 fastapi
 uvicorn[standard]
+aiomax2 @ git+https://github.com/CandyCrimsie/aiomax2.git
 mosdiary
 certifi
 python-dotenv
