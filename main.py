@@ -12,12 +12,13 @@ from maxapi.types import (
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
 # ============ НАСТРОЙКА ============
+# MAX_BOT_TOKEN Bothost подставляет сам.
+# ADMIN_IDS задаётся в панели Bothost (переменные окружения).
 TOKEN = os.environ.get("MAX_BOT_TOKEN") or os.environ.get("MAX_TOKEN") or ""
 if not TOKEN:
     raise SystemExit("Нет токена: задай MAX_BOT_TOKEN в переменных окружения Bothost")
 
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
-ALLOWED_IDS = {int(x) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()} | ADMIN_IDS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("diary")
@@ -40,36 +41,40 @@ db.commit()
 
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
 
-# ============ БЕЗОПАСНОСТЬ ============
+# ============ ПОЛЬЗОВАТЕЛИ И ДОСТУП ============
 def get_uid(event):
+    """ID пользователя. Для кнопок — кто нажал, а не кто отправил сообщение."""
+    cb = getattr(event, "callback", None)
+    if cb is not None:
+        user = getattr(cb, "user", None) or getattr(cb, "sender", None)
+        if user is not None and getattr(user, "user_id", None) is not None:
+            return user.user_id
     msg = getattr(event, "message", None)
     if msg is not None and getattr(msg, "sender", None) is not None:
         return msg.sender.user_id
-    cb = getattr(event, "callback", None)
-    if cb is not None and getattr(cb, "user", None) is not None:
-        return cb.user.user_id
-    u = getattr(event, "user", None)          # для BotStarted
+    u = getattr(event, "user", None)  # BotStarted
     if u is not None and getattr(u, "user_id", None) is not None:
         return u.user_id
     return None
 
 def user_role(uid):
+    """Бот доступен всем: кто не админ — тот ученик."""
+    if uid is None:
+        return None
     row = db.execute("SELECT role FROM users WHERE user_id=?", (uid,)).fetchone()
     if row:
         return row[0]
-    return "admin" if uid in ADMIN_IDS else ("student" if uid in ALLOWED_IDS else "banned")
+    return "admin" if uid in ADMIN_IDS else "student"
 
 def guard(handler):
+    """Пускает всех, пишет лог действий."""
     async def wrapper(event, *args, **kwargs):
         uid = get_uid(event)
-        role = user_role(uid) if uid is not None else "banned"
-        if role == "banned":
-            logger.warning("Чужой стучится: id=%s", uid)
-            return
-        logger.info("id=%s (%s) -> %s", uid, role, type(event).__name__)
+        logger.info("id=%s (%s) -> %s", uid, user_role(uid), type(event).__name__)
         return await handler(event)
     return wrapper
 
+# ============ КЛАВИАТУРА ============
 def main_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.row(CallbackButton(text="📅 Расписание", payload="sched"))
@@ -84,7 +89,6 @@ dp = Dispatcher()
 @dp.bot_started()
 @guard
 async def bot_started(event: BotStarted):
-    logger.info("bot_started: новый пользователь id=%s", get_uid(event))
     await bot.send_message(chat_id=event.chat_id,
                            text="Дневник запущен 🎒 Отправь /start, чтобы открыть меню.")
 
@@ -92,6 +96,7 @@ async def bot_started(event: BotStarted):
 @guard
 async def start(event: MessageCreated):
     uid = get_uid(event)
+    # админа из ADMIN_IDS записываем в базу при первом /start
     if user_role(uid) == "admin" and not db.execute(
         "SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
         db.execute("INSERT INTO users VALUES (?,?, 'admin')",
@@ -102,7 +107,7 @@ async def start(event: MessageCreated):
         attachments=[main_menu_kb()],
     )
 
-# ============ КНОПКИ ============
+# ============ КНОПКИ (доступны всем) ============
 @dp.message_callback(F.callback.payload == "sched")
 @guard
 async def show_schedule(event: MessageCallback):
@@ -117,6 +122,7 @@ async def show_schedule(event: MessageCallback):
             out.append(f"{day}{mark}\n" + "\n".join(
                 f"{r[0]}. {r[1]} (каб. {r[2] or '—'}, {r[3] or ''})" for r in rows))
     await event.message.answer("\n\n".join(out) or "Расписание пустое — попроси админа заполнить.")
+    await event.answer(notification="Готово")
 
 @dp.message_callback(F.callback.payload == "hw")
 @guard
@@ -124,6 +130,7 @@ async def show_hw(event: MessageCallback):
     rows = db.execute("SELECT subject, task, due_date FROM homework WHERE done=0").fetchall()
     await event.message.answer("\n".join(f"• {r[0]} (до {r[2]}): {r[1]}" for r in rows)
                                or "Домашки нет 🎉")
+    await event.answer(notification="Готово")
 
 @dp.message_callback(F.callback.payload == "grades")
 @guard
@@ -133,8 +140,9 @@ async def show_grades(event: MessageCallback):
                       (uid,)).fetchall()
     await event.message.answer("\n".join(f"{r[0]}: {r[1]} ({r[2]})" for r in rows)
                                or "Оценок пока нет.")
+    await event.answer(notification="Готово")
 
-# ============ КОМАНДЫ АДМИНА ============
+# ============ КОМАНДЫ АДМИНА (закрыты для остальных) ============
 @dp.message_created(Command("add_lesson"))
 @guard
 async def add_lesson(event: MessageCreated):
@@ -183,7 +191,7 @@ async def grant(event: MessageCreated):
         return await event.message.answer("Формат: /grant <user_id> <student|admin>")
     db.execute("INSERT OR REPLACE INTO users VALUES (?,?,?)", (int(p[0]), "", p[1]))
     db.commit()
-    await event.message.answer("✅ Доступ выдан.")
+    await event.message.answer("✅ Доступ настроен.")
 
 # ============ FALLBACK ============
 @dp.message_created()
@@ -193,7 +201,7 @@ async def fallback(event: MessageCreated):
         await event.message.answer("Не понял 🤔 Нажми /start, чтобы открыть меню.")
 
 async def main():
-    # Снимаем webhook-подписки: пока они висят, polling молча не получает события
+    # Снимаем webhook-подписки: пока они висят, polling не получает события
     try:
         await bot.delete_webhook()
         logger.info("Webhook-подписки сняты, запускаю polling")
